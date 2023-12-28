@@ -1,6 +1,6 @@
 import markdownIt from "markdown-it";
 
-import { Dict, StringDict, LLMResponseError, LLMResponseObject, StandardizedLLMResponse, ChatHistory, ChatHistoryInfo, isEqualChatHistory } from "./typing";
+import { Dict, StringDict, LLMResponseError, LLMResponseObject, StandardizedLLMResponse, ChatHistoryInfo, isEqualChatHistory } from "./typing";
 import { LLM, getEnumName } from "./models";
 import { APP_IS_RUNNING_LOCALLY, set_api_keys, FLASK_BASE_URL, call_flask_backend } from "./utils";
 import StorageCache from "./cache";
@@ -11,11 +11,6 @@ import { PromptPermutationGenerator, PromptTemplate } from "./template";
 //     SETUP AND GLOBALS
 //     =================
 // """
-
-let LLM_NAME_MAP = {};
-Object.entries(LLM).forEach(([key, value]) => {
-  LLM_NAME_MAP[value] = key;
-});
 
 enum MetricType {
   KeyValue = 0,
@@ -142,25 +137,9 @@ function get_cache_keys_related_to_id(cache_id: string, include_basefile: boolea
 }
 
 async function setAPIKeys(api_keys: StringDict): Promise<void> {
-  if (APP_IS_RUNNING_LOCALLY()) {
-    // Try to fetch API keys from os.environ variables in the locally running Flask backend:
-    try {
-      const api_keys = await fetchEnvironAPIKeys();
-      set_api_keys(api_keys);
-    } catch (err) {
-      console.warn('Warning: Could not fetch API key environment variables from Flask server. Error:', err.message);
-      // Soft fail
-    }
-  }
-
   if (api_keys !== undefined)
     set_api_keys(api_keys);
 }
-
-// def remove_cached_responses(cache_id: str):
-//     cache_files = get_cache_keys_related_to_id(cache_id)
-//     for filename in cache_files:
-//         os.remove(os.path.join(CACHE_DIR, filename))
 
 /**
  * Loads the cache JSON file at filepath. 
@@ -219,6 +198,15 @@ function extract_llm_params(llm_spec: Dict | string): Dict {
     return {};
 }
 
+function filterVarsByLLM(vars: Dict, llm_key: string): Dict {
+  let _vars = {};
+  Object.entries(vars).forEach(([key, val]) => {
+    const vs = Array.isArray(val) ? val : [val];
+    _vars[key] = vs.filter((v) => (typeof v === 'string' || v?.llm === undefined || (v?.llm?.key === llm_key)));
+  });
+  return _vars;
+}
+
 /**
  * Test equality akin to Python's list equality.
  */
@@ -268,6 +256,10 @@ function matching_settings(cache_llm_spec: Dict | string, llm_spec: Dict | strin
 
 function areSetsEqual(xs: Set<any>, ys: Set<any>): boolean {
     return xs.size === ys.size && [...xs].every((x) => ys.has(x));
+}
+
+function allStringsAreNumeric(strs: Array<string>) {
+  return strs.every(s => !isNaN(parseFloat(s)));
 }
 
 function check_typeof_vals(arr: Array<any>): MetricType {
@@ -327,38 +319,47 @@ function check_typeof_vals(arr: Array<any>): MetricType {
     return val_type;
 }
 
-function run_over_responses(eval_func: (resp: ResponseInfo) => any, responses: Array<StandardizedLLMResponse>): Array<StandardizedLLMResponse> {
+function run_over_responses(process_func: (resp: ResponseInfo) => any, 
+                            responses: StandardizedLLMResponse[],
+                            process_type: 'evaluator' | 'processor'): StandardizedLLMResponse[] {
   return responses.map((_resp_obj: StandardizedLLMResponse) => {
     // Deep clone the response object
-    const resp_obj = JSON.parse(JSON.stringify(_resp_obj));
+    let resp_obj = JSON.parse(JSON.stringify(_resp_obj));
 
-    // Map the evaluator func over every individual response text in each response object
+    // Map the processor func over every individual response text in each response object
     const res = resp_obj.responses;
-    const evals = res.map(
-      (r: string) => eval_func(new ResponseInfo(r, 
-                                                resp_obj.prompt, 
-                                                resp_obj.vars, 
-                                                resp_obj.metavars || {}, 
-                                                extract_llm_nickname(resp_obj.llm))
-    ));
+    const processed = res.map((r: string) => 
+      process_func(new ResponseInfo(r, 
+                                    resp_obj.prompt, 
+                                    resp_obj.vars, 
+                                    resp_obj.metavars || {}, 
+                                    extract_llm_nickname(resp_obj.llm)))
+    );
 
-    // Check the type of evaluation results
-    // NOTE: We assume this is consistent across all evaluations, but it may not be.
-    const eval_res_type = check_typeof_vals(evals);
+    // If type is just a processor
+    if (process_type === 'processor') {
+      // Replace response texts in resp_obj with the transformed ones:
+      resp_obj.responses = processed;
 
-    if (eval_res_type === MetricType.Numeric) {
-        // Store items with summary of mean, median, etc
-        resp_obj.eval_res = {
-          items: evals,
+    } else { // If type is an evaluator
+      // Check the type of evaluation results
+      // NOTE: We assume this is consistent across all evaluations, but it may not be.
+      const eval_res_type = check_typeof_vals(processed);
+
+      if (eval_res_type === MetricType.Numeric) {
+          // Store items with summary of mean, median, etc
+          resp_obj.eval_res = {
+            items: processed,
+            dtype: getEnumName(MetricType, eval_res_type),
+          };
+      } else if ([MetricType.Unknown, MetricType.Empty].includes(eval_res_type)) {
+        throw new Error('Unsupported types found in evaluation results. Only supported types for metrics are: int, float, bool, str.');
+      } else {
+        // Categorical, KeyValue, etc, we just store the items:
+        resp_obj.eval_res = { 
+          items: processed,
           dtype: getEnumName(MetricType, eval_res_type),
-        };
-    } else if ([MetricType.Unknown, MetricType.Empty].includes(eval_res_type)) {
-      throw new Error('Unsupported types found in evaluation results. Only supported types for metrics are: int, float, bool, str.');
-    } else {
-      // Categorical, KeyValue, etc, we just store the items:
-      resp_obj.eval_res = { 
-        items: evals,
-        dtype: getEnumName(MetricType, eval_res_type),
+        }
       }
     }
 
@@ -377,9 +378,9 @@ function run_over_responses(eval_func: (resp: ResponseInfo) => any, responses: A
  * @param vars a dict of the template variables to fill the prompt template with, by name. (See countQueries docstring for more info).
  * @returns An array of strings representing the prompts that will be sent out. Note that this could include unfilled template vars.
  */
-export async function generatePrompts(root_prompt: string, vars: Dict): Promise<string[]> {  
+export async function generatePrompts(root_prompt: string, vars: Dict): Promise<PromptTemplate[]> {  
   const gen_prompts = new PromptPermutationGenerator(root_prompt);
-  const all_prompt_permutations = Array.from(gen_prompts.generate(vars)).map(p => p.toString());
+  const all_prompt_permutations = Array.from(gen_prompts.generate(vars));
   return all_prompt_permutations;
 }
 
@@ -401,14 +402,24 @@ export async function countQueries(prompt: string,
                                    llms: Array<Dict | string>, 
                                    n: number, 
                                    chat_histories?: ChatHistoryInfo[] | {[key: string]: ChatHistoryInfo[]}, 
-                                   id?: string): Promise<Dict> {
+                                   id?: string,
+                                   cont_only_w_prior_llms?: boolean): Promise<Dict> {
   if (chat_histories === undefined) chat_histories = [ undefined ];
 
   let gen_prompts: PromptPermutationGenerator;
-  let all_prompt_permutations: Array<PromptTemplate>;
+  let all_prompt_permutations: Array<PromptTemplate> | Dict;
   try {
     gen_prompts = new PromptPermutationGenerator(prompt);
-    all_prompt_permutations = Array.from(gen_prompts.generate(vars));
+    if (cont_only_w_prior_llms && Array.isArray(llms)) {
+      all_prompt_permutations = {};
+      llms.forEach(llm_spec => {
+        const llm_key = extract_llm_key(llm_spec);
+        all_prompt_permutations[llm_key] = Array.from(gen_prompts.generate(filterVarsByLLM(vars, llm_key)));
+      });
+    } else {
+      all_prompt_permutations = Array.from(gen_prompts.generate(vars));
+    }
+
   } catch (err) {
     return {error: err.message};
   }
@@ -438,6 +449,9 @@ export async function countQueries(prompt: string,
   llms.forEach(llm_spec => {
     const llm_key = extract_llm_key(llm_spec);
 
+    // Get only the relevant prompt permutations
+    let _all_prompt_perms = cont_only_w_prior_llms ? all_prompt_permutations[llm_key] : all_prompt_permutations;
+
     // Get the relevant chat histories for this LLM:
     const chat_hists = (!Array.isArray(chat_histories)
                         ? chat_histories[extract_llm_nickname(llm_spec)] 
@@ -454,7 +468,7 @@ export async function countQueries(prompt: string,
         const cache_llm_responses = load_from_cache(cache_filename);
 
         // Iterate through all prompt permutations and check if how many responses there are in the cache with that prompt
-        all_prompt_permutations.forEach(prompt => {
+        _all_prompt_perms.forEach(prompt => {
           let prompt_str = prompt.toString();
 
           add_to_num_responses_req(llm_key, n * chat_hists.length);
@@ -496,7 +510,7 @@ export async function countQueries(prompt: string,
     }
     
     if (!found_cache) {
-      all_prompt_permutations.forEach(perm => {
+      _all_prompt_perms.forEach(perm => {
         add_to_num_responses_req(llm_key, n * chat_hists.length);
         add_to_missing_queries(llm_key, perm.toString(), n * chat_hists.length);
       });
@@ -543,7 +557,8 @@ export async function queryLLM(id: string,
                                chat_histories?: ChatHistoryInfo[] | {[key: string]: ChatHistoryInfo[]},
                                api_keys?: Dict,
                                no_cache?: boolean,
-                               progress_listener?: (progress: {[key: symbol]: any}) => void): Promise<Dict> {
+                               progress_listener?: (progress: {[key: symbol]: any}) => void,
+                               cont_only_w_prior_llms?: boolean): Promise<Dict> {
   // Verify the integrity of the params
   if (typeof id !== 'string' || id.trim().length === 0)
     return {'error': 'id is improper format (length 0 or not a string)'};
@@ -554,22 +569,18 @@ export async function queryLLM(id: string,
   // Ensure llm param is an array
   if (typeof llm === 'string')
     llm = [ llm ];
-  llm = llm as (Array<string> | Array<Dict>); 
 
-  for (let i = 0; i < llm.length; i++) {
-    const llm_spec = llm[i];
-    if (!(extract_llm_name(llm_spec) in LLM_NAME_MAP)) 
-      return {'error': `LLM named '${llm_spec}' is not supported.`};
-  }
+  llm = llm as (Array<string> | Array<Dict>);
 
-  await setAPIKeys(api_keys);
-
-  // if 'no_cache' in data and data['no_cache'] is True:
-  //     remove_cached_responses(data['id'])
+  if (api_keys !== undefined)
+    set_api_keys(api_keys);
   
   // Get the storage keys of any cache files for specific models + settings
   const llms = llm;
   let cache: Dict = StorageCache.get(`${id}.json`) || {};  // returns {} if 'id' is not in the storage cache yet
+
+  // Ignore cache if no_cache is present
+  if (no_cache) cache = {};
 
   let llm_to_cache_filename = {};
   let past_cache_files = {};
@@ -605,7 +616,8 @@ export async function queryLLM(id: string,
   }
 
   // Store the overall cache file for this id:
-  StorageCache.store(`${id}.json`, cache);
+  if (!no_cache)
+    StorageCache.store(`${id}.json`, cache);
 
   // Create a Proxy object to 'listen' for changes to a variable (see https://stackoverflow.com/a/50862441)
   // and then stream those changes back to a provided callback used to update progress bars.
@@ -634,6 +646,12 @@ export async function queryLLM(id: string,
     let llm_params = extract_llm_params(llm_spec);
     let llm_key = extract_llm_key(llm_spec);
     let temperature: number = llm_params?.temperature !== undefined ? llm_params.temperature : 1.0;
+    let _vars = vars;
+
+    if (cont_only_w_prior_llms) {
+      // Filter vars so that only the var values with the matching LLM are used, or otherwise values with no LLM metadata
+      _vars = filterVarsByLLM(vars, llm_key);
+    }
 
     let chat_hists = ((chat_histories !== undefined && !Array.isArray(chat_histories)) 
                       ? chat_histories[llm_nickname]
@@ -641,7 +659,7 @@ export async function queryLLM(id: string,
 
     // Create an object to query the LLM, passing a storage key for cache'ing responses
     const cache_filepath = llm_to_cache_filename[llm_key];
-    const prompter = new PromptPipeline(prompt, cache_filepath);
+    const prompter = new PromptPipeline(prompt, no_cache ? undefined : cache_filepath);
 
     // Prompt the LLM with all permutations of the input prompt template:
     // NOTE: If the responses are already cache'd, this just loads them (no LLM is queried, saving $$$)
@@ -653,7 +671,7 @@ export async function queryLLM(id: string,
       console.log(`Querying ${llm_str}...`)
 
       // Yield responses for 'llm' for each prompt generated from the root template 'prompt' and template variables in 'properties':
-      for await (const response of prompter.gen_responses(vars, llm_str as LLM, num_generations, temperature, llm_params, chat_hists)) {
+      for await (const response of prompter.gen_responses(_vars, llm_str as LLM, num_generations, temperature, llm_params, chat_hists)) {
         
         // Check for selective failure
         if (response instanceof LLMResponseError) {  // The request failed
@@ -703,7 +721,31 @@ export async function queryLLM(id: string,
   }
 
   // Convert the responses into a more standardized format with less information
-  const res = Object.values(responses).flatMap(rs => rs.map(to_standard_format));
+  let res = Object.values(responses).flatMap(rs => rs.map(to_standard_format));
+
+  // Reorder the responses to match the original vars dict ordering of keys and values
+  let vars_lookup = {}; // we create a lookup table for faster sort
+  Object.entries(vars).forEach(([varname, vals]) => {
+    vars_lookup[varname] = {};
+    vals.forEach((vobj: Dict | string, i: number) => {
+      const v = typeof vobj === "string" ? vobj : vobj?.text;
+      vars_lookup[varname][v] = i;
+    });
+  });
+  res.sort((a, b) => {
+    if (!a.vars || !b.vars) return 0;
+    for (const [varname, vals] of Object.entries(vars_lookup)) {
+      if (varname in a.vars && varname in b.vars) {
+        const a_val = a.vars[varname];
+        const b_val = b.vars[varname];
+        const a_idx = vals[a_val];
+        const b_idx = vals[b_val];
+        if (a_idx > -1 && b_idx > -1 && a_idx !== b_idx) 
+          return a_idx - b_idx;
+      }
+    }
+    return 0;
+  });
   
   // Save the responses *of this run* to the storage cache, for further recall:
   let cache_filenames = past_cache_files;
@@ -712,10 +754,11 @@ export async function queryLLM(id: string,
     cache_filenames[filename] = llm_spec;
   });
 
-  StorageCache.store(`${id}.json`, {
-    cache_files: cache_filenames,
-    responses_last_run: res,
-  });
+  if (!no_cache)
+    StorageCache.store(`${id}.json`, {
+      cache_files: cache_filenames,
+      responses_last_run: res,
+    });
   
   // Return all responses for all LLMs
   return {
@@ -734,93 +777,79 @@ export async function queryLLM(id: string,
  * 
  * @param id a unique ID to refer to this information. Used when cache'ing evaluation results. 
  * @param code the code to evaluate. Must include an 'evaluate()' function that takes a 'response' of type ResponseInfo. Alternatively, can be the evaluate function itself.
- * @param response_ids the cache'd response to run on, which must be a unique ID or list of unique IDs of cache'd data
- * @param scope the scope of responses to run on --a single response, or all across each batch. (If batch, evaluate() func has access to 'responses'.)
+ * @param responses the cache'd response to run on, which must be a unique ID or list of unique IDs of cache'd data
+ * @param scope the scope of responses to run on --a single response, or all across each batch. (If batch, evaluate() func has access to 'responses'.) NOTE: Currently this feature is disabled.
+ * @param process_type the type of processing to perform. Evaluators only 'score'/annotate responses with an 'eval_res' key. Processors change responses (e.g. text).
  */
 export async function executejs(id: string, 
                                 code: string | ((rinfo: ResponseInfo) => any), 
-                                response_ids: string | string[], 
-                                scope: 'response' | 'batch'): Promise<Dict> {
-  // Check format of response_ids
-  if (!Array.isArray(response_ids))
-    response_ids = [ response_ids ];
-  response_ids = response_ids as Array<string>;
+                                responses: StandardizedLLMResponse[], 
+                                scope: 'response' | 'batch',
+                                process_type: 'evaluator' | 'processor'): Promise<Dict> {
+  const req_func_name = (!process_type || process_type === 'evaluator') ? 'evaluate' : 'process';
 
   // Instantiate the evaluator function by eval'ing the passed code
   // DANGER DANGER!!
   let iframe: HTMLElement | undefined;
+  let process_func: any;
   if (typeof code === 'string') {
     try {
-        /*
-          To run Javascript code in a psuedo-'sandbox' environment, we
-          can use an iframe and run eval() inside the iframe, instead of the current environment.
-          This is slightly safer than using eval() directly, doesn't clog our namespace, and keeps
-          multiple Evaluate node execution environments separate. 
-          
-          The Evaluate node in the front-end has a hidden iframe with the following id. 
-          We need to get this iframe element. 
-        */
-        iframe = document.getElementById(`${id}-iframe`);
-        if (!iframe)
-          throw new Error("Could not find iframe sandbox for evaluator node.");
+      /*
+        To run Javascript code in a psuedo-'sandbox' environment, we
+        can use an iframe and run eval() inside the iframe, instead of the current environment.
+        This is slightly safer than using eval() directly, doesn't clog our namespace, and keeps
+        multiple Evaluate node execution environments separate. 
+        
+        The Evaluate node in the front-end has a hidden iframe with the following id. 
+        We need to get this iframe element. 
+      */
+      iframe = document.getElementById(`${id}-iframe`);
+      if (!iframe)
+        throw new Error("Could not find iframe sandbox for evaluator node.");
 
-        // Now run eval() on the 'window' of the iframe:
-        // @ts-ignore
-        iframe.contentWindow.eval(code);
+      // Now run eval() on the 'window' of the iframe:
+      // @ts-ignore
+      iframe.contentWindow.eval(code);
 
-        // Now check that there is an 'evaluate' method in the iframe's scope.
-        // NOTE: We need to tell Typescript to ignore this, since it's a dynamic type check.
-        // @ts-ignore
-        if (iframe.contentWindow.evaluate === undefined) {
-          throw new Error('evaluate() function is undefined.');
-        }
+      // Now check that there is an 'evaluate' method in the iframe's scope.
+      // NOTE: We need to tell Typescript to ignore this, since it's a dynamic type check.
+      // @ts-ignore
+      process_func = (!process_type || process_type === 'evaluator') ? iframe.contentWindow.evaluate : iframe.contentWindow.process;
+      if (process_func === undefined)
+        throw new Error(`${req_func_name}() function is undefined.`);
+
     } catch (err) {
-      return {'error': `Could not compile evaluator code. Error message:\n${err.message}`};
+      return {'error': `Could not compile code. Error message:\n${err.message}`};
     }
   }
 
   // Load all responses with the given ID:
-  let all_evald_responses: StandardizedLLMResponse[] = [];
   let all_logs: string[] = [];
-  for (let i = 0; i < response_ids.length; i++) {
-    const cache_id = response_ids[i];
-    const fname = `${cache_id}.json`;
-    if (!StorageCache.has(fname))
-      return {error: `Did not find cache file for id ${cache_id}`, logs: all_logs};
+  let processed_resps: StandardizedLLMResponse[];
+  try {
+    // Intercept any calls to console.log, .warn, or .error, so we can store the calls
+    // and print them in the 'output' footer of the Evaluator Node: 
+    // @ts-ignore
+    HIJACK_CONSOLE_LOGGING(id, iframe.contentWindow);
 
-    // Load the raw responses from the cache
-    const responses = load_cache_responses(fname);
-    if (responses.length === 0)
-      continue;
+    // Run the user-defined 'evaluate' function over the responses: 
+    // NOTE: 'evaluate' here was defined dynamically from 'eval' above. We've already checked that it exists. 
+    // @ts-ignore
+    processed_resps = run_over_responses((iframe ? process_func : code), responses, process_type);
 
-    let evald_responses: StandardizedLLMResponse[];
-    try {
-      // Intercept any calls to console.log, .warn, or .error, so we can store the calls
-      // and print them in the 'output' footer of the Evaluator Node: 
-      // @ts-ignore
-      HIJACK_CONSOLE_LOGGING(id, iframe.contentWindow);
-
-      // Run the user-defined 'evaluate' function over the responses: 
-      // NOTE: 'evaluate' here was defined dynamically from 'eval' above. We've already checked that it exists. 
-      // @ts-ignore
-      evald_responses = run_over_responses((iframe ? iframe.contentWindow.evaluate : code), responses, scope);
-
-      // Revert the console.log, .warn, .error back to browser default:
-      // @ts-ignore
-      all_logs = all_logs.concat(REVERT_CONSOLE_LOGGING(id, iframe.contentWindow));
-    } catch (err) {
-      // @ts-ignore
-      all_logs = all_logs.concat(REVERT_CONSOLE_LOGGING(id, iframe.contentWindow));
-      return { error: `Error encountered while trying to run "evaluate" method:\n${err.message}`, logs: all_logs };
-    }
-
-    all_evald_responses = all_evald_responses.concat(evald_responses);
+    // Revert the console.log, .warn, .error back to browser default:
+    // @ts-ignore
+    all_logs = all_logs.concat(REVERT_CONSOLE_LOGGING(id, iframe.contentWindow));
+  } catch (err) {
+    // @ts-ignore
+    all_logs = all_logs.concat(REVERT_CONSOLE_LOGGING(id, iframe.contentWindow));
+    return { error: `Error encountered while trying to run "evaluate" method:\n${err.message}`, logs: all_logs };
   }
 
   // Store the evaluated responses in a new cache json:
-  StorageCache.store(`${id}.json`, all_evald_responses);
+  StorageCache.store(`${id}.json`, processed_resps);
 
-  return {responses: all_evald_responses, logs: all_logs};
+  return {responses: processed_resps, logs: all_logs};
 }
 
 /**
@@ -833,28 +862,19 @@ export async function executejs(id: string,
  * @param id a unique ID to refer to this information. Used when cache'ing evaluation results. 
  * @param code the code to evaluate. Must include an 'evaluate()' function that takes a 'response' of type ResponseInfo. Alternatively, can be the evaluate function itself.
  * @param response_ids the cache'd response to run on, which must be a unique ID or list of unique IDs of cache'd data
- * @param scope the scope of responses to run on --a single response, or all across each batch. (If batch, evaluate() func has access to 'responses'.)
+ * @param scope the scope of responses to run on --a single response, or all across each batch. (If batch, evaluate() func has access to 'responses'.) NOTE: Currently disabled.
+ * @param process_type the type of processing to perform. Evaluators only 'score'/annotate responses with an 'eval_res' key. Processors change responses (e.g. text).
  */
 export async function executepy(id: string, 
                                 code: string | ((rinfo: ResponseInfo) => any), 
-                                response_ids: string | string[], 
+                                responses: StandardizedLLMResponse[], 
                                 scope: 'response' | 'batch',
+                                process_type: 'evaluator' | 'processor',
                                 script_paths?: string[]): Promise<Dict> {
   if (!APP_IS_RUNNING_LOCALLY()) {
     // We can't execute Python if we're not running the local Flask server. Error out:
     throw new Error("Cannot evaluate Python code: ChainForge does not appear to be running on localhost.")
   }
-
-  // Check format of response_ids
-  if (!Array.isArray(response_ids))
-    response_ids = [ response_ids ];
-  response_ids = response_ids as Array<string>;
-
-  // Load cache'd responses for all response_ids:
-  const {responses, error} = await grabResponses(response_ids);
-
-  if (error !== undefined)
-    throw new Error(error);
   
   // All responses loaded; call our Python server to execute the evaluation code across all responses:
   const flask_response = await call_flask_backend('executepy', {
@@ -862,6 +882,7 @@ export async function executepy(id: string,
     code: code,
     responses: responses,
     scope: scope,
+    process_type: process_type,
     script_paths: script_paths,
   }).catch(err => {
     throw new Error(err.message);
@@ -901,7 +922,8 @@ export async function evalWithLLM(id: string,
     response_ids = [ response_ids ];
   response_ids = response_ids as Array<string>;
 
-  if (api_keys) setAPIKeys(api_keys);
+  if (api_keys !== undefined)
+    set_api_keys(api_keys);
 
   // Load all responses with the given ID:
   let all_evald_responses: StandardizedLLMResponse[] = [];
@@ -948,30 +970,35 @@ export async function evalWithLLM(id: string,
     all_evald_responses = all_evald_responses.concat(resp_objs);
   }
 
-  // Do additional processing to check if all evaluations are boolean-ish (e.g., 'true' and 'false')
-  let all_eval_res = new Set();
+  // Do additional processing to check if all evaluations are 
+  // boolean-ish (e.g., 'true' and 'false') or all numeric-ish (parseable as numbers)
+  let all_eval_res: Set<string> = new Set();
   for (const resp_obj of all_evald_responses) {
     if (!resp_obj.eval_res) continue;
     for (const score of resp_obj.eval_res.items) {
       if (score !== undefined)
         all_eval_res.add(score.trim().toLowerCase());
     }
-    if (all_eval_res.size > 2) 
-      break;  // it's categorical if size is over 2
   }
-  if (all_eval_res.size === 2) {
-    // Check if the results are boolean-ish:
-    if ((all_eval_res.has('true') && all_eval_res.has('false')) || 
-        (all_eval_res.has('yes') && all_eval_res.has('no'))) {
-      // Convert all eval results to boolean datatypes:
-      all_evald_responses.forEach(resp_obj => {
-        resp_obj.eval_res.items = resp_obj.eval_res.items.map((i: string) => {
-          const li = i.toLowerCase();
-          return li === 'true' || li === 'yes';
-        });
-        resp_obj.eval_res.dtype = 'Categorical';
+
+  // Check if the results are boolean-ish:
+  if (all_eval_res.size === 2 && (all_eval_res.has('true') || all_eval_res.has('false') ||
+      all_eval_res.has('yes') || all_eval_res.has('no'))) {
+    // Convert all eval results to boolean datatypes:
+    all_evald_responses.forEach(resp_obj => {
+      resp_obj.eval_res.items = resp_obj.eval_res.items.map((i: string) => {
+        const li = i.toLowerCase();
+        return li === 'true' || li === 'yes';
       });
-    }
+      resp_obj.eval_res.dtype = 'Categorical';
+    });
+  // Check if the results are all numeric-ish:
+  } else if (allStringsAreNumeric(Array.from(all_eval_res))) {
+    // Convert all eval results to numeric datatypes:
+    all_evald_responses.forEach(resp_obj => {
+      resp_obj.eval_res.items = resp_obj.eval_res.items.map((i: string) => parseFloat(i));
+      resp_obj.eval_res.dtype = 'Numeric';
+    });
   }
 
   // Store the evaluated responses in a new cache json:
@@ -1115,4 +1142,58 @@ export async function fetchOpenAIEval(evalname: string): Promise<Dict> {
   return fetch(`oaievals/${evalname}.cforge`)
               .then(response => response.json())
               .then(res => ({data: res}));
+}
+
+/**
+ * Passes a Python script to load a custom model provider to the Flask backend.
+
+ * @param code The Python script to pass, as a string. 
+ * @returns a Promise with the JSON of the response. Will include 'error' key if error'd; if success, 
+ *          a 'providers' key with a list of all loaded custom provider callbacks, as dicts.
+ */
+export async function initCustomProvider(code: string): Promise<Dict> {
+  // Attempt to fetch the example flow from the local filesystem
+  // by querying the Flask server: 
+  return fetch(`${FLASK_BASE_URL}app/initCustomProvider`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'},
+    body: JSON.stringify({ code })
+  }).then(function(res) {
+    return res.json();
+  });
+}
+
+/**
+ * Asks Python script to remove a custom provider with name 'name'.
+
+ * @param name The name of the provider to remove. The name must match the name in the `ProviderRegistry`.  
+ * @returns a Promise with the JSON of the response. Will include 'error' key if error'd; if success, 
+ *          a 'success' key with a true value.
+ */
+export async function removeCustomProvider(name: string): Promise<Dict> {
+  // Attempt to fetch the example flow from the local filesystem
+  // by querying the Flask server: 
+  return fetch(`${FLASK_BASE_URL}app/removeCustomProvider`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'},
+    body: JSON.stringify({ name })
+  }).then(function(res) {
+    return res.json();
+  });
+}
+
+/**
+ * Asks Python backend to load custom provider scripts that are cache'd in the user's local dir. 
+ * 
+ * @returns a Promise with the JSON of the response. Will include 'error' key if error'd; if success, 
+ *          a 'providers' key with all loaded custom providers in an array. If there were none, returns empty array.
+ */
+export async function loadCachedCustomProviders(): Promise<Dict> {
+  return fetch(`${FLASK_BASE_URL}app/loadCachedCustomProviders`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'},
+    body: "{}"
+  }).then(function(res) {
+    return res.json();
+  });
 }

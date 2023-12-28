@@ -1,8 +1,9 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { Handle } from 'react-flow-renderer';
+import { Handle } from 'reactflow';
 import { NativeSelect } from '@mantine/core';
 import useStore, { colorPalettes } from './store';
 import Plot from 'react-plotly.js';
+import BaseNode from './BaseNode';
 import NodeLabel from './NodeLabelComponent';
 import PlotLegend from './PlotLegend';
 import fetch_from_backend from './fetch_from_backend';
@@ -68,7 +69,7 @@ const genUniqueShortnames = (names, max_chars_per_line=32) => {
     // Generate unique 'shortnames' to refer to each name:
     let past_shortnames_counts = {};
     let shortnames = {};
-    const max_lines = 2;
+    const max_lines = 8;
     for (const name of names) {
         // Truncate string up to maximum num of chars
         let sn = truncStr(name, max_chars_per_line * max_lines - 3);
@@ -149,11 +150,19 @@ const VisNode = ({ data, id }) => {
     useEffect(() => {
         if (!responses || responses.length === 0 || !multiSelectValue) return;
 
+        // Check if there are evaluation results 
+        if (responses.every(r => r?.eval_res === undefined)) {
+            setPlaceholderText(<p style={{maxWidth: '220px', backgroundColor: '#f0f0aa', padding: '10px', fontSize: '10pt'}}>
+                To plot evaluation results, you need to run LLM responses through an Evaluator Node or LLM Scorer Node first.
+            </p>);
+            return;
+        }
+
         setStatus('none');
 
         const get_llm = (resp_obj) => {
             if (selectedLLMGroup === 'LLM')
-                return resp_obj.llm;
+                return typeof resp_obj.llm === "string" ? resp_obj.llm : resp_obj.llm?.name;
             else
                 return resp_obj.metavars[selectedLLMGroup];
         };
@@ -203,7 +212,7 @@ const VisNode = ({ data, id }) => {
 
         // Get the type of evaluation results, if present
         // (This is assumed to be consistent across response batches)
-        let typeof_eval_res = 'dtype' in responses[0].eval_res ? responses[0].eval_res['dtype'] : 'Numeric';
+        let typeof_eval_res = (responses[0].eval_res && 'dtype' in responses[0].eval_res) ? responses[0].eval_res['dtype'] : 'Numeric';
 
         // If categorical type, check if all binary:
         if (typeof_eval_res === 'Categorical') {
@@ -243,6 +252,7 @@ const VisNode = ({ data, id }) => {
         };
 
         const get_items = (eval_res_obj) => {
+            if (eval_res_obj === undefined) return [];
             if (typeof_eval_res.includes('KeyValue'))
                 return eval_res_obj.items.map(item => item[metric_axes_labels[0]]);
             return eval_res_obj.items;
@@ -656,7 +666,7 @@ const VisNode = ({ data, id }) => {
             if (json.responses && json.responses.length > 0) {
 
                 // Store responses and extract + store vars
-                setResponses(json.responses);
+                setResponses(json.responses.toReversed());
 
                 // Find all vars in responses
                 let varnames = new Set();
@@ -728,7 +738,7 @@ const VisNode = ({ data, id }) => {
       }, [plotDivRef, plotlySpec]);
 
     return (
-      <div className="vis-node cfnode">
+      <BaseNode classNames="vis-node" nodeId={id}>
         <NodeLabel title={data.title || 'Vis Node'} 
                    nodeId={id}
                    status={status}
@@ -786,7 +796,7 @@ const VisNode = ({ data, id }) => {
             style={{ top: '50%' }}
             onConnect={handleOnConnect}
         />
-      </div>
+      </BaseNode>
     );
   };
   

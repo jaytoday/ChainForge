@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
-import { Handle } from 'react-flow-renderer';
+import { Handle } from 'reactflow';
 import useStore from './store';
+import BaseNode from './BaseNode';
 import NodeLabel from './NodeLabelComponent';
 import LLMResponseInspector, { exportToExcel } from './LLMResponseInspector';
 import fetch_from_backend from './fetch_from_backend';
@@ -55,14 +56,14 @@ const InspectorNode = ({ data, id }) => {
   }, [data, id, handleOnConnect, setDataPropsForNode]);
 
   return (
-    <div className="inspector-node cfnode">
+    <BaseNode classNames="inspector-node" nodeId={id}>
     <NodeLabel title={data.title || 'Inspect Node'} 
                 nodeId={id}
                 icon={'🔍'}
                 customButtons={[
                     <button className="custom-button" key="export-data" onClick={() => exportToExcel(jsonResponses)}>Export data</button>
                 ]} />
-      <div className='inspect-response-container nowheel nodrag'>
+      <div className='inspect-response-container nowheel nodrag' style={{marginTop: '-8pt'}}>
         <LLMResponseInspector jsonResponses={jsonResponses} />
       </div>
       <Handle
@@ -73,7 +74,7 @@ const InspectorNode = ({ data, id }) => {
         style={{ top: "50%" }}
         onConnect={handleOnConnect}
       />
-    </div>
+    </BaseNode>
   );
 };
 

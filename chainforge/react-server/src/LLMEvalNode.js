@@ -1,22 +1,26 @@
 import React, { useState, useCallback, useRef, useEffect } from 'react';
-import { Handle } from 'react-flow-renderer';
-import { Button, Alert, Progress, Textarea } from '@mantine/core';
+import { Handle } from 'reactflow';
+import { Alert, Progress, Textarea } from '@mantine/core';
 import { IconAlertTriangle, IconRobot, IconSearch } from "@tabler/icons-react";
 import { v4 as uuid } from 'uuid';
 import useStore from './store';
+import BaseNode from './BaseNode';
 import NodeLabel from './NodeLabelComponent';
 import fetch_from_backend from './fetch_from_backend';
-import { AvailableLLMs, getDefaultModelSettings } from './ModelSettingSchemas';
+import { getDefaultModelSettings } from './ModelSettingSchemas';
 import { LLMListContainer } from './LLMListComponent';
 import LLMResponseInspectorModal from './LLMResponseInspectorModal';
+import InspectFooter from './InspectFooter';
+import { initLLMProviders } from './store';
+import LLMResponseInspectorDrawer from './LLMResponseInspectorDrawer';
 
 // The default prompt shown in gray highlights to give people a good example of an evaluation prompt. 
 const PLACEHOLDER_PROMPT = "Respond with 'true' if the text below has a positive sentiment, and 'false' if not. Do not reply with anything else.";
 
 // The default LLM annotator is GPT-4 at temperature 0.
 const DEFAULT_LLM_ITEM = (() => {
-  let item = [AvailableLLMs.find(i => i.base_model === 'gpt-4')]
-                           .map((i) => ({key: uuid(), settings: getDefaultModelSettings(i.base_model), ...i}))[0];
+  let item = [initLLMProviders.find(i => i.base_model === 'gpt-4')]
+                              .map((i) => ({key: uuid(), settings: getDefaultModelSettings(i.base_model), ...i}))[0];
   item.settings.temperature = 0.0;
   return item;
 })();
@@ -26,11 +30,15 @@ const LLMEvaluatorNode = ({ data, id }) => {
   const [promptText, setPromptText] = useState(data.prompt || "");
   const [status, setStatus] = useState('none');
   const alertModal = useRef(null);
+
   const inspectModal = useRef(null);
+  const [uninspectedResponses, setUninspectedResponses] = useState(false);
+  const [showDrawer, setShowDrawer] = useState(false);
 
   const setDataPropsForNode = useStore((state) => state.setDataPropsForNode);
   const inputEdgesForNode = useStore((state) => state.inputEdgesForNode);
   const pingOutputNodes = useStore((state) => state.pingOutputNodes);
+  const bringNodeToFront = useStore((state) => state.bringNodeToFront);
   const apiKeys = useStore((state) => state.apiKeys);
 
   const [lastResponses, setLastResponses] = useState([]);
@@ -99,11 +107,13 @@ const LLMEvaluatorNode = ({ data, id }) => {
   
         console.log(json.responses);
         setLastResponses(json.responses);
+        if (!showDrawer)
+          setUninspectedResponses(true);
         setStatus('ready');
         setProgress(undefined);
       }).catch(handleError);
     });
-  }, [inputEdgesForNode, promptText, llmScorers, apiKeys, pingOutputNodes, setStatus, alertModal]);
+  }, [inputEdgesForNode, promptText, llmScorers, apiKeys, pingOutputNodes, setStatus, showDrawer, alertModal]);
 
   const handlePromptChange = useCallback((event) => {
     // Store prompt text
@@ -120,8 +130,10 @@ const LLMEvaluatorNode = ({ data, id }) => {
   }, []);
 
   const showResponseInspector = useCallback(() => {
-    if (inspectModal && inspectModal.current && lastResponses)
+    if (inspectModal && inspectModal.current && lastResponses) {
+      setUninspectedResponses(false);
       inspectModal.current.trigger();
+    }
   }, [inspectModal, lastResponses]);
 
   useEffect(() => {
@@ -132,7 +144,7 @@ const LLMEvaluatorNode = ({ data, id }) => {
   }, [data]);
 
   return (
-    <div className="evaluator-node cfnode">
+    <BaseNode classNames="evaluator-node" nodeId={id}>
       <NodeLabel title={data.title || 'LLM Scorer'} 
                   nodeId={id} 
                   icon={<IconRobot size="16px" />} 
@@ -189,10 +201,21 @@ const LLMEvaluatorNode = ({ data, id }) => {
         />
       
       { lastResponses && lastResponses.length > 0 ? 
-        (<div className="eval-inspect-response-footer nodrag" onClick={showResponseInspector} style={{display: 'flex', justifyContent:'center'}}>
-          <Button color='blue' variant='subtle' w='100%' >Inspect scores&nbsp;<IconSearch size='12pt'/></Button>
-        </div>) : <></>}
-    </div>
+        (<InspectFooter label={<>Inspect scores&nbsp;<IconSearch size='12pt'/></>}
+                        onClick={showResponseInspector}
+                        showNotificationDot={uninspectedResponses} 
+                        isDrawerOpen={showDrawer}
+                        showDrawerButton={true} 
+                        onDrawerClick={() => {
+                          setShowDrawer(!showDrawer); 
+                          setUninspectedResponses(false);
+                          bringNodeToFront(id);
+                        }}
+         />) : <></>}
+      
+      <LLMResponseInspectorDrawer jsonResponses={lastResponses} showDrawer={showDrawer} />
+
+    </BaseNode>
   );
 };
 

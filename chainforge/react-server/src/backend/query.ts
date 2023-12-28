@@ -1,6 +1,6 @@
 import { PromptTemplate, PromptPermutationGenerator } from "./template";
-import { LLM, RATE_LIMITS } from './models';
-import { Dict, LLMResponseError, LLMResponseObject, ChatHistory, isEqualChatHistory, ChatHistoryInfo } from "./typing";
+import { LLM, NativeLLM, RATE_LIMITS } from './models';
+import { Dict, LLMResponseError, LLMResponseObject, isEqualChatHistory, ChatHistoryInfo } from "./typing";
 import { extract_responses, merge_response_objs, call_llm, mergeDicts } from "./utils";
 import StorageCache from "./cache";
 
@@ -164,7 +164,7 @@ export class PromptPipeline {
         }
 
         if (!prompt.is_concrete())
-          throw Error(`Cannot send a prompt '${prompt}' to LLM: Prompt is a template.`)
+          throw new Error(`Cannot send a prompt '${prompt}' to LLM: Prompt is a template.`)
         
         // Get the cache of responses with respect to this prompt, + normalize format so it's always an array (of size >= 0)
         const cache_bucket = responses[prompt_str];
@@ -191,7 +191,7 @@ export class PromptPipeline {
             "query": cached_resp["query"],
             "responses": extracted_resps.slice(0, n),
             "raw_response": cached_resp["raw_response"],
-            "llm": cached_resp["llm"] || LLM.OpenAI_ChatGPT,
+            "llm": cached_resp["llm"] || NativeLLM.OpenAI_ChatGPT,
             // We want to use the new info, since 'vars' could have changed even though 
             // the prompt text is the same (e.g., "this is a tool -> this is a {x} where x='tool'")
             "info": mergeDicts(info, chat_history?.fill_history),
@@ -240,7 +240,8 @@ export class PromptPipeline {
    * Useful for continuing if computation was interrupted halfway through. 
    */
   _load_cached_responses(): {[key: string]: (LLMResponseObject | LLMResponseObject[])} {
-    return StorageCache.get(this._storageKey) || {};
+    if (this._storageKey === undefined) return {};
+    else return StorageCache.get(this._storageKey) || {};
   }
 
   /**
@@ -248,7 +249,8 @@ export class PromptPipeline {
    * (Overrides the existing responses stored in the cache.)
    */
   _cache_responses(responses: Dict): void {
-    StorageCache.store(this._storageKey, responses);
+    if (this._storageKey !== undefined)
+      StorageCache.store(this._storageKey, responses);
   }
 
   async _prompt_llm(llm: LLM, 

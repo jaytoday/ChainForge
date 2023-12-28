@@ -1,9 +1,9 @@
 /*
-* @jest-environment node
+* @jest-environment jsdom
 */
-import { LLM } from '../models';
+import { NativeLLM } from '../models';
 import { expect, test } from '@jest/globals';
-import { queryLLM, executejs, countQueries, ResponseInfo } from '../backend';
+import { queryLLM, executejs, countQueries, ResponseInfo, grabResponses } from '../backend';
 import { StandardizedLLMResponse, Dict } from '../typing';
 import StorageCache from '../cache';
 
@@ -32,14 +32,14 @@ test('count queries required', async () => {
   };
 
   // Try a number of different inputs
-  await test_count_queries([LLM.OpenAI_ChatGPT, LLM.Claude_v1], 3);
+  await test_count_queries([NativeLLM.OpenAI_ChatGPT, NativeLLM.Claude_v1], 3);
   await test_count_queries([{ name: "Claude", key: 'claude-test', emoji: "📚", model: "claude-v1", base_model: "claude-v1", temp: 0.5 }], 5);
 });
 
 test('call three LLMs with a single prompt', async () => {
   // Setup params to call
   const prompt = 'What is one major difference between French and English languages? Be brief.'
-  const llms = [LLM.OpenAI_ChatGPT, LLM.Claude_v1, LLM.PaLM2_Chat_Bison];
+  const llms = [NativeLLM.OpenAI_ChatGPT, NativeLLM.Claude_v1, NativeLLM.PaLM2_Chat_Bison];
   const n = 1;
   const progress_listener = (progress: {[key: symbol]: any}) => {
     console.log(JSON.stringify(progress));
@@ -69,6 +69,8 @@ test('run evaluate func over responses', async () => {
     return response.text.length;
   };
 
+  const input_resps = await grabResponses(['dummy_response_id']) as StandardizedLLMResponse[];
+
 //   const code = `
 // function evaluate(response) {
 //   console.log('hello there!');
@@ -77,7 +79,7 @@ test('run evaluate func over responses', async () => {
 // `;
 
   // Execute the code, and map the evaluate function over all responses
-  const {responses, logs, error} = await executejs('evalid', code, ['dummy_response_id'], 'response');
+  const {responses, logs, error} = await executejs('evalid', code, input_resps, 'response', 'evaluator');
 
   // There should be no errors
   if (error)

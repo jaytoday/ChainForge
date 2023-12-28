@@ -5,19 +5,22 @@ import React, { useState, useCallback, useRef, useEffect } from 'react';
 import ReactFlow, {
   Controls,
   Background,
-} from 'react-flow-renderer';
-import { Button, Menu, LoadingOverlay, Text, Box, List, Loader, Header, Chip, Badge, Card, Accordion, Tooltip } from '@mantine/core';
+} from 'reactflow';
+import { Button, Menu, LoadingOverlay, Text, Box, List, Loader, Tooltip } from '@mantine/core';
 import { useClipboard } from '@mantine/hooks';
-import { IconSettings, IconTextPlus, IconTerminal, IconCsv, IconSettingsAutomation, IconFileSymlink, IconRobot } from '@tabler/icons-react';
+import { IconSettings, IconTextPlus, IconTerminal, IconSettingsAutomation, IconFileSymlink, IconRobot, IconRuler2, IconArrowMerge, IconArrowsSplit, IconForms } from '@tabler/icons-react';
+import RemoveEdge from './RemoveEdge';
 import TextFieldsNode from './TextFieldsNode'; // Import a custom node
 import PromptNode from './PromptNode';
-import EvaluatorNode from './EvaluatorNode';
+import CodeEvaluatorNode from './CodeEvaluatorNode';
 import VisNode from './VisNode';
 import InspectNode from './InspectorNode';
 import ScriptNode from './ScriptNode';
 import AlertModal from './AlertModal';
-import CsvNode from './CsvNode';
+import ItemsNode from './ItemsNode';
 import TabularDataNode from './TabularDataNode';
+import JoinNode from './JoinNode';
+import SplitNode from './SplitNode';
 import CommentNode from './CommentNode';
 import GlobalSettingsModal from './GlobalSettingsModal';
 import ExampleFlowsModal from './ExampleFlowsModal';
@@ -27,17 +30,21 @@ import { getDefaultModelFormData, getDefaultModelSettings } from './ModelSetting
 import { v4 as uuid } from 'uuid';
 import LZString from 'lz-string';
 import { EXAMPLEFLOW_1 } from './example_flows';
-import './text-fields-node.css';
+
+// Styling
+import 'reactflow/dist/style.css'; // reactflow
+import './text-fields-node.css'; // project
 
 // State management (from https://reactflow.dev/docs/guides/state-management/)
 import { shallow } from 'zustand/shallow';
 import useStore from './store';
 import fetch_from_backend from './fetch_from_backend';
 import StorageCache from './backend/cache';
-import { APP_IS_RUNNING_LOCALLY } from './backend/utils';
+import { APP_IS_RUNNING_LOCALLY, browserTabIsActive } from './backend/utils';
 
 // Device / Browser detection
 import { isMobile, isChrome, isFirefox, isEdgeChromium, isChromium } from 'react-device-detect';
+import SimpleEvalNode from './SimpleEvalNode';
 const IS_ACCEPTED_BROWSER = (isChrome || isChromium || isEdgeChromium || isFirefox || navigator?.brave !== undefined) && !isMobile;
 
 const selector = (state) => ({
@@ -50,6 +57,7 @@ const selector = (state) => ({
   setNodes: state.setNodes,
   setEdges: state.setEdges,
   resetLLMColors: state.resetLLMColors,
+  setAPIKeys: state.setAPIKeys,
 });
 
 // The initial LLM to use when new flows are created, or upon first load
@@ -69,20 +77,26 @@ const INITIAL_LLM = () => {
   return falcon7b;
 };
 
-// import AnimatedConnectionLine from './AnimatedConnectionLine';
-
 const nodeTypes = {
   textfields: TextFieldsNode, // Register the custom node
   prompt: PromptNode,
   chat: PromptNode,
-  evaluator: EvaluatorNode,
+  simpleval: SimpleEvalNode,
+  evaluator: CodeEvaluatorNode,
   llmeval: LLMEvaluatorNode,
   vis: VisNode,
   inspect: InspectNode,
   script: ScriptNode,
-  csv: CsvNode,
+  csv: ItemsNode,
   table: TabularDataNode,
   comment: CommentNode,
+  join: JoinNode,
+  split: SplitNode,
+  processor: CodeEvaluatorNode,
+};
+
+const edgeTypes = {
+  default: RemoveEdge,
 };
 
 // Whether we are running on localhost or not, and hence whether
@@ -110,14 +124,18 @@ const getSharedFlowURLParam = () => {
   return undefined;
 };
 
+const MenuTooltip = ({ label, children }) => {
+  return (<Tooltip label={label} position="right" width={200} multiline withArrow arrowSize={10}>{children}</Tooltip>);
+};
+
 // const connectionLineStyle = { stroke: '#ddd' };
 const snapGrid = [16, 16];
-let saveIntervalInitialized = false;
 
 const App = () => {
 
   // Get nodes, edges, etc. state from the Zustand store:
-  const { nodes, edges, onNodesChange, onEdgesChange, onConnect, addNode, setNodes, setEdges, resetLLMColors } = useStore(selector, shallow);
+  const { nodes, edges, onNodesChange, onEdgesChange, 
+          onConnect, addNode, setNodes, setEdges, resetLLMColors, setAPIKeys } = useStore(selector, shallow);
 
   // For saving / loading
   const [rfInstance, setRfInstance] = useState(null);
@@ -156,8 +174,9 @@ const App = () => {
   }
   const getViewportCenter = () => {
     const { centerX, centerY } = getWindowCenter();
-    const { x, y } = rfInstance.getViewport();
-    return ({x: -x+centerX, y:-y+centerY});
+    // Support Zoom
+    const { x, y, zoom } = rfInstance.getViewport();
+    return ({x: -(x / zoom) + (centerX / zoom), y: -(y / zoom) + (centerY / zoom)});
   }
 
   const addTextFieldsNode = () => {
@@ -172,6 +191,10 @@ const App = () => {
     const { x, y } = getViewportCenter();
     addNode({ id: 'chatTurn-'+Date.now(), type: 'chat', data: { prompt: '' }, position: {x: x-200, y:y-100} });
   };
+  const addSimpleEvalNode = () => {
+    const { x, y } = getViewportCenter();
+    addNode({ id: 'simpleEval-'+Date.now(), type: 'simpleval', data: {}, position: {x: x-200, y:y-100} });
+  };
   const addEvalNode = (progLang) => {
     const { x, y } = getViewportCenter();
     let code = "";
@@ -181,33 +204,50 @@ const App = () => {
       code = "function evaluate(response) {\n  return response.text.length;\n}";
     addNode({ id: 'evalNode-'+Date.now(), type: 'evaluator', data: { language: progLang, code: code }, position: {x: x-200, y:y-100} });
   };
-  const addVisNode = (event) => {
+  const addVisNode = () => {
     const { x, y } = getViewportCenter();
     addNode({ id: 'visNode-'+Date.now(), type: 'vis', data: {}, position: {x: x-200, y:y-100} });
   };
-  const addInspectNode = (event) => {
+  const addInspectNode = () => {
     const { x, y } = getViewportCenter();
     addNode({ id: 'inspectNode-'+Date.now(), type: 'inspect', data: {}, position: {x: x-200, y:y-100} });
   };
-  const addScriptNode = (event) => {
+  const addScriptNode = () => {
     const { x, y } = getViewportCenter();
     addNode({ id: 'scriptNode-'+Date.now(), type: 'script', data: {}, position: {x: x-200, y:y-100} });
   };
-  const addCsvNode = (event) => {
+  const addItemsNode = () => {
     const { x, y } = getViewportCenter();
     addNode({ id: 'csvNode-'+Date.now(), type: 'csv', data: {}, position: {x: x-200, y:y-100} });
   };
-  const addTabularDataNode = (event) => {
+  const addTabularDataNode = () => {
     const { x, y } = getViewportCenter();
     addNode({ id: 'table-'+Date.now(), type: 'table', data: {}, position: {x: x-200, y:y-100} });
   };
-  const addCommentNode = (event) => {
+  const addCommentNode = () => {
     const { x, y } = getViewportCenter();
     addNode({ id: 'comment-'+Date.now(), type: 'comment', data: {}, position: {x: x-200, y:y-100} });
   };
   const addLLMEvalNode = () => {
     const { x, y } = getViewportCenter();
     addNode({ id: 'llmeval-'+Date.now(), type: 'llmeval', data: {}, position: {x: x-200, y:y-100} });
+  };
+  const addJoinNode = () => {
+    const { x, y } = getViewportCenter();
+    addNode({ id: 'join-'+Date.now(), type: 'join', data: {}, position: {x: x-200, y:y-100} });
+  };
+  const addSplitNode = () => {
+    const { x, y } = getViewportCenter();
+    addNode({ id: 'split-'+Date.now(), type: 'split', data: {}, position: {x: x-200, y:y-100} });
+  };
+  const addProcessorNode = (progLang) => {
+    const { x, y } = getViewportCenter();
+    let code = "";
+    if (progLang === 'python') 
+      code = "def process(response):\n  return response.text;";
+    else if (progLang === 'javascript')
+      code = "function process(response) {\n  return response.text;\n}";
+    addNode({ id: 'process-'+Date.now(), type: 'processor', data: { language: progLang, code: code }, position: {x: x-200, y:y-100} });
   };
 
   const onClickExamples = () => {
@@ -258,10 +298,11 @@ const App = () => {
   const saveFlow = useCallback((rf_inst) => {
     const rf = rf_inst || rfInstance;
     if (!rf) return;
+
     // NOTE: This currently only saves the front-end state. Cache files
     // are not pulled or overwritten upon loading from localStorage. 
     const flow = rf.toObject();
-    localStorage.setItem('chainforge-flow', JSON.stringify(flow));
+    StorageCache.saveToLocalStorage('chainforge-flow', flow);
 
     // Attempt to save the current state of the back-end state,
     // the StorageCache. (This does LZ compression to save space.)
@@ -277,7 +318,7 @@ const App = () => {
     const uid = (id) => `${id}-${Date.now()}`;
     const starting_nodes = [
       { id: uid('prompt'), type: 'prompt', data: { 
-          prompt: 'Why is the sky blue?',
+          prompt: '',
           n: 1, 
           llms: [INITIAL_LLM()] },
         position: { x: 450, y: 200 } },
@@ -294,7 +335,7 @@ const App = () => {
     if (flow) {
       if (rf_inst) {
         if (flow.viewport)
-          rf_inst.setViewport({x: flow.viewport.x || 0, y: flow.viewport.y || 0, zoom: 1});
+          rf_inst.setViewport({x: flow.viewport.x || 0, y: flow.viewport.y || 0, zoom: flow.viewport.zoom || 1});
         else
           rf_inst.setViewport({x:0, y:0, zoom:1});
       }
@@ -303,18 +344,20 @@ const App = () => {
       setEdges(flow.edges || []); 
 
       // Save flow that user loaded to autosave cache, in case they refresh the browser
-      localStorage.setItem('chainforge-flow', JSON.stringify(flow));
-      StorageCache.saveToLocalStorage('chainforge-state');
+      StorageCache.saveToLocalStorage('chainforge-flow', flow);
+      
+      // Start auto-saving, if it's not already enabled
+      if (rf_inst) initAutosaving(rf_inst);
     }
   };
   const autosavedFlowExists = () => {
     return localStorage.getItem('chainforge-flow') !== null;
   };
   const loadFlowFromAutosave = async (rf_inst) => {
-    const saved_flow = localStorage.getItem('chainforge-flow');
+    const saved_flow = StorageCache.loadFromLocalStorage('chainforge-flow', false);
     if (saved_flow) {
       StorageCache.loadFromLocalStorage('chainforge-state');
-      loadFlow(JSON.parse(saved_flow), rf_inst);
+      loadFlow(saved_flow, rf_inst);
     }
   };
 
@@ -567,16 +610,50 @@ const App = () => {
 
   }, [rfInstance, nodes, IS_RUNNING_LOCALLY, handleError, clipboard, waitingForShare]);
 
+  // Initialize auto-saving
+  const initAutosaving = (rf_inst) => {
+    if (autosavingInterval !== null) return;  // autosaving interval already set
+    console.log("Init autosaving!");
+
+    // Autosave the flow to localStorage every minute:
+    const interv = setInterval(() => {
+      // Check the visibility of the browser tab --if it's not visible, don't autosave
+      if (!browserTabIsActive()) return;
+
+      // Start a timer, in case the saving takes a long time
+      const startTime = Date.now();
+
+      // Save the flow to localStorage
+      saveFlow(rf_inst);
+
+      // Check how long the save took
+      const duration = Date.now() - startTime;
+      if (duration > 1500) {
+        // If the operation took longer than 1.5 seconds, that's not good.
+        // Although this function is called async inside setInterval, 
+        // calls to localStorage block the UI in JavaScript, freezing the screen.
+        // We smart-disable autosaving here when we detect it's starting the freeze the UI:
+        console.warn("Autosaving disabled. The time required to save to localStorage exceeds 1 second. This can happen when there's a lot of data in your flow. Make sure to export frequently to save your work.");
+        clearInterval(interv);
+        setAutosavingInterval(null);
+      }
+    }, 60000); // 60000 milliseconds = 1 minute
+    setAutosavingInterval(interv);
+  };
+
   // Run once upon ReactFlow initialization
   const onInit = (rf_inst) => {
     setRfInstance(rf_inst);
 
-    // Autosave the flow to localStorage every minute:
-    console.log('set autosaving interval');
-    const interv = setInterval(() => saveFlow(rf_inst), 60000); // 60000 milliseconds = 1 minute
-    setAutosavingInterval(interv);
-
-    if (!IS_RUNNING_LOCALLY) {
+    if (IS_RUNNING_LOCALLY) {
+      // If we're running locally, try to fetch API keys from Python os.environ variables in the locally running Flask backend:
+      fetch_from_backend('fetchEnvironAPIKeys').then((api_keys) => {
+        setAPIKeys(api_keys);
+      }).catch((err) => {
+        // Soft fail
+        console.warn('Warning: Could not fetch API key environment variables from Flask server. Error:', err.message);
+      });
+    } else {
 
       // Check if there's a shared flow UID in the URL as a GET param
       // If so, we need to look it up in the database and attempt to load it:
@@ -663,7 +740,7 @@ const App = () => {
   }
   else return (
     <div>
-      <GlobalSettingsModal ref={settingsModal} />
+      <GlobalSettingsModal ref={settingsModal} alertModal={alertModal} />
       <AlertModal ref={alertModal} />
       <LoadingOverlay visible={isLoading} overlayBlur={1} />
       <ExampleFlowsModal ref={examplesModal} onSelect={onSelectExampleFlow} />
@@ -684,9 +761,12 @@ const App = () => {
             nodes={nodes}
             edges={edges}
             nodeTypes={nodeTypes}
+            edgeTypes={edgeTypes}
             zoomOnPinch={false}
             zoomOnScroll={false}
             panOnScroll={true}
+            disableKeyboardA11y={true}
+            deleteKeyCode={[]}
             // connectionLineComponent={AnimatedConnectionLine}
             // connectionLineStyle={connectionLineStyle}
             snapToGrid={true}
@@ -701,34 +781,82 @@ const App = () => {
 
       <div id="custom-controls" style={{position: 'fixed', left: '10px', top: '10px', zIndex:8}}>
         <Menu transitionProps={{ transition: 'pop-top-left' }}
-                          position="top-start"
-                          width={220}
-                          closeOnClickOutside={true}
-                      >
+              position="top-start"
+              width={220}
+              closeOnClickOutside={true}
+              closeOnEscape
+              styles={{item: { maxHeight: '28px' }}}
+        >
           <Menu.Target>
-              <Button size="sm" variant="gradient" compact mr='sm'>Add Node +</Button>
+            <Button size="sm" variant="gradient" compact mr='sm'>Add Node +</Button>
           </Menu.Target>
           <Menu.Dropdown>
-              <Menu.Item onClick={addTextFieldsNode} icon={<IconTextPlus size="16px" />}> TextFields </Menu.Item>
+            <Menu.Label>Input Data</Menu.Label>
+            <MenuTooltip label="Specify input text to prompt or chat nodes. You can also declare variables in brackets {} to chain TextFields together." >
+              <Menu.Item onClick={addTextFieldsNode} icon={<IconTextPlus size="16px" />}> TextFields Node </Menu.Item>
+            </MenuTooltip>
+            <MenuTooltip label="Specify inputs as a comma-separated list of items. Good for specifying lots of short text values. An alternative to TextFields node.">
+              <Menu.Item onClick={addItemsNode} icon={<IconForms size="16px" />}> Items Node </Menu.Item>
+            </MenuTooltip>
+            <MenuTooltip label="Import or create a spreadhseet of data to use as input to prompt or chat nodes. Import accepts xlsx, csv, and jsonl.">
               <Menu.Item onClick={addTabularDataNode} icon={'🗂️'}> Tabular Data Node </Menu.Item>
+            </MenuTooltip>
+            <Menu.Divider />
+            <Menu.Label>Prompters</Menu.Label>
+            <MenuTooltip label="Prompt one or multiple LLMs. Specify prompt variables in brackets {}.">
               <Menu.Item onClick={addPromptNode} icon={'💬'}> Prompt Node </Menu.Item>
+            </MenuTooltip>
+            <MenuTooltip label="Start or continue a conversation with chat models. Attach Prompt Node output as past context to continue chatting past the first turn.">
               <Menu.Item onClick={addChatTurnNode} icon={'🗣'}> Chat Turn Node </Menu.Item>
-              <Menu.Item onClick={() => addEvalNode('javascript')} icon={<IconTerminal size="16px" />}> JavaScript Evaluator Node </Menu.Item>
-              {IS_RUNNING_LOCALLY ? (
-                <Menu.Item onClick={() => addEvalNode('python')} icon={<IconTerminal size="16px" />}> Python Evaluator Node </Menu.Item>
-              ): <></>}
-              <Menu.Item onClick={addLLMEvalNode} icon={<IconRobot size="16px" />}> LLM Scorer Node</Menu.Item>
+            </MenuTooltip>
+            <Menu.Divider />
+            <Menu.Label>Evaluators</Menu.Label>
+            <MenuTooltip label="Evaluate responses with a simple check (no coding required).">
+              <Menu.Item onClick={addSimpleEvalNode} icon={<IconRuler2 size="16px" />}> Simple Evaluator </Menu.Item>
+            </MenuTooltip>
+            <MenuTooltip label="Evaluate responses by writing JavaScript code.">
+              <Menu.Item onClick={() => addEvalNode('javascript')} icon={<IconTerminal size="16px" />}> JavaScript Evaluator </Menu.Item>
+            </MenuTooltip>
+            {IS_RUNNING_LOCALLY ? (<MenuTooltip label="Evaluate responses by writing Python code.">
+                  <Menu.Item onClick={() => addEvalNode('python')} icon={<IconTerminal size="16px" />}> Python Evaluator </Menu.Item>
+            </MenuTooltip>): <></>}
+            <MenuTooltip label="Evaluate responses with an LLM like GPT-4.">
+              <Menu.Item onClick={addLLMEvalNode} icon={<IconRobot size="16px" />}> LLM Scorer </Menu.Item>
+            </MenuTooltip>
+            <Menu.Divider />
+            <Menu.Label>Visualizers</Menu.Label>
+            <MenuTooltip label="Plot evaluation results. (Attach an evaluator or scorer node as input.)">
               <Menu.Item onClick={addVisNode} icon={'📊'}> Vis Node </Menu.Item>
+            </MenuTooltip>
+            <MenuTooltip label="Used to inspect responses from prompter or evaluation nodes, without opening up the pop-up view.">
               <Menu.Item onClick={addInspectNode} icon={'🔍'}> Inspect Node </Menu.Item>
-              <Menu.Item onClick={addCsvNode} icon={<IconCsv size="16px" />}> CSV Node </Menu.Item>
+            </MenuTooltip>
+            <Menu.Divider />
+            <Menu.Label>Processors</Menu.Label>
+            <MenuTooltip label="Transform responses by mapping a JavaScript function over them.">
+              <Menu.Item onClick={() => addProcessorNode('javascript')} icon={<IconTerminal size='14pt' />}> JavaScript Processor </Menu.Item>
+            </MenuTooltip>
+            {IS_RUNNING_LOCALLY ? <MenuTooltip label="Transform responses by mapping a Python function over them.">
+              <Menu.Item onClick={() => addProcessorNode('python')} icon={<IconTerminal size='14pt' />}> Python Processor </Menu.Item>
+            </MenuTooltip>: <></>}
+            <MenuTooltip label="Concatenate responses or input data together before passing into later nodes, within or across variables and LLMs.">
+              <Menu.Item onClick={addJoinNode} icon={<IconArrowMerge size='14pt' />}> Join Node </Menu.Item>
+            </MenuTooltip>
+            <MenuTooltip label="Split responses or input data by some format. For instance, you can split a markdown list into separate items.">
+              <Menu.Item onClick={addSplitNode} icon={<IconArrowsSplit size='14pt' />}> Split Node </Menu.Item>
+            </MenuTooltip>
+            <Menu.Divider />
+            <Menu.Label>Misc</Menu.Label>
+            <MenuTooltip label="Make a comment about your flow.">
               <Menu.Item onClick={addCommentNode} icon={'✏️'}> Comment Node </Menu.Item>
-              {IS_RUNNING_LOCALLY ? (
-                <Menu.Item onClick={addScriptNode} icon={<IconSettingsAutomation size="16px" />}> Global Python Scripts </Menu.Item>
-              ): <></>}
+            </MenuTooltip>
+            {IS_RUNNING_LOCALLY ? (<MenuTooltip label="Specify directories to load as local packages, so they can be imported in your Python evaluator nodes (add to sys path).">
+              <Menu.Item onClick={addScriptNode} icon={<IconSettingsAutomation size="16px" />}> Global Python Scripts </Menu.Item>
+            </MenuTooltip>): <></>}
           </Menu.Dropdown>
         </Menu>
-        <Button onClick={exportFlow} size="sm" variant="outline" compact mr='xs'>Export</Button>
-        <Button onClick={importFlowFromFile} size="sm" variant="outline" compact>Import</Button>
+        <Button onClick={exportFlow} size="sm" variant="outline" bg="#eee" compact mr='xs'>Export</Button>
+        <Button onClick={importFlowFromFile} size="sm" variant="outline" bg="#eee" compact>Import</Button>
       </div>
       <div style={{position: 'fixed', right: '10px', top: '10px', zIndex: 8}}>
         {IS_RUNNING_LOCALLY ? (<></>) : (
@@ -740,7 +868,7 @@ const App = () => {
             {clipboard.copied ? 'Link copied!' : (waitingForShare ? 'Sharing...' : 'Share')}
           </Button>
         )}
-        <Button onClick={onClickNewFlow} size="sm" variant="outline" compact mr='xs' style={{float: 'left'}}> New Flow </Button>
+        <Button onClick={onClickNewFlow} size="sm" variant="outline" bg="#eee" compact mr='xs' style={{float: 'left'}}> New Flow </Button>
         <Button onClick={onClickExamples} size="sm" variant="filled" compact mr='xs' style={{float: 'left'}}> Example Flows </Button>
         <Button onClick={onClickSettings} size="sm" variant="gradient" compact><IconSettings size={"90%"} /></Button>
       </div>

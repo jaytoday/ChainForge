@@ -98,9 +98,9 @@ For more specific details, see the [Node Guide](https://github.com/ianarawjo/Cha
 
 # Development
 
-ChainForge was created by [Ian Arawjo](http://ianarawjo.com/index.html), a postdoctoral scholar in Harvard HCI's [Glassman Lab](http://glassmanlab.seas.harvard.edu/) with support from the Harvard HCI community. Collaborators include PhD students [Priyan Vaithilingam](https://priyan.info) and [Chelse Swoopes](https://seas.harvard.edu/person/chelse-swoopes) and faculty members [Elena Glassman](http://glassmanlab.seas.harvard.edu/glassman.html) and [Martin Wattenberg](https://www.bewitched.com/about.html).
+ChainForge was created by [Ian Arawjo](http://ianarawjo.com/index.html), a postdoctoral scholar in Harvard HCI's [Glassman Lab](http://glassmanlab.seas.harvard.edu/) with support from the Harvard HCI community. Collaborators include PhD students [Priyan Vaithilingam](https://priyan.info) and [Chelse Swoopes](https://seas.harvard.edu/person/chelse-swoopes), Harvard undergraduate [Sean Yang](https://shawsean.com), and faculty members [Elena Glassman](http://glassmanlab.seas.harvard.edu/glassman.html) and [Martin Wattenberg](https://www.bewitched.com/about.html).
 
-This work was partially funded by the NSF grant IIS-2107391. Any opinions, findings, and conclusions or recommendations expressed in this material are those of the author(s) and do not necessarily reflect the views of the National Science Foundation.
+This work was partially funded by the NSF grants IIS-2107391, IIS-2040880, and IIS-1955699. Any opinions, findings, and conclusions or recommendations expressed in this material are those of the author(s) and do not necessarily reflect the views of the National Science Foundation.
 
 We provide ongoing releases of this tool in the hopes that others find it useful for their projects.
 
@@ -114,23 +114,22 @@ Unlike these projects, we are focusing on supporting evaluation across prompts, 
 
 ## How to collaborate?
 
-We welcome open-source collaborators. If you want to report a bug or request a feature, open an [Issue](https://github.com/ianarawjo/ChainForge/issues). We also encourage users to implement the requested feature / bug fix and submit a Pull Request. 
-
-_(If you are an investor or funder, send us a message via email.)_
+We welcome open-source collaborators. If you want to report a bug or request a feature, open an [Issue](https://github.com/ianarawjo/ChainForge/issues). We also encourage users to implement the requested feature / bug fix and submit a Pull Request.
 
 ------------------
 # Cite Us
 
-If you use ChainForge for research purposes, or build upon the source code, we ask that you cite this project in any related publications.
-The BibTeX you can use for now is:
+If you use ChainForge for research purposes, or build upon the source code, we ask that you cite our [arXiv pre-print](https://arxiv.org/abs/2309.09128) in any related publications.
+The BibTeX you can use is:
 
 ```bibtex
-@misc{Arawjo_2023,
-  author = {Arawjo, Ian and Vaithilingam, Priyan and Swoopes, Chelse and Wattenberg, Martin and Glassman, Elena},
-  title = {ChainForge},
-  year = {2023},
-  howpublished = {\url{https://www.chainforge.ai/}},
-  note = {Accessed: 2023-07-21}
+@misc{arawjo2023chainforge,
+      title={ChainForge: A Visual Toolkit for Prompt Engineering and LLM Hypothesis Testing}, 
+      author={Ian Arawjo and Chelse Swoopes and Priyan Vaithilingam and Martin Wattenberg and Elena Glassman},
+      year={2023},
+      eprint={2309.09128},
+      archivePrefix={arXiv},
+      primaryClass={cs.HC}
 }
 ```
 

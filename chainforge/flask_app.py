@@ -1,11 +1,12 @@
-import json, os, asyncio, sys, traceback
+import json, os, sys, asyncio, time
 from dataclasses import dataclass
 from enum import Enum
 from typing import List
 from statistics import mean, median, stdev
 from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
-from chainforge.promptengine.utils import LLM, call_dalai
+from chainforge.providers.dalai import call_dalai
+from chainforge.providers import ProviderRegistry
 import requests as py_requests
 
 """ =================
@@ -16,6 +17,7 @@ import requests as py_requests
 # Setup Flask app to serve static version of React front-end
 HOSTNAME = "localhost"
 PORT = 8000
+# SESSION_TOKEN = secrets.token_hex(32)
 BUILD_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'react-server', 'build')
 STATIC_DIR = os.path.join(BUILD_DIR, 'static')
 app = Flask(__name__, static_folder=STATIC_DIR, template_folder=BUILD_DIR)
@@ -26,10 +28,6 @@ cors = CORS(app, resources={r"/*": {"origins": "*"}})
 # The cache and examples files base directories
 CACHE_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'cache')
 EXAMPLES_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'examples')
-
-LLM_NAME_MAP = {} 
-for model in LLM:
-    LLM_NAME_MAP[model.value] = model
 
 class MetricType(Enum):
     KeyValue = 0
@@ -160,12 +158,12 @@ def check_typeof_vals(arr: list) -> MetricType:
     else:
         return val_type
 
-def run_over_responses(eval_func, responses: list, scope: str) -> list:
+def run_over_responses(process_func, responses: list, scope: str, process_type: str) -> list:
     for resp_obj in responses:
         res = resp_obj['responses']
         if scope == 'response':
-            # Run evaluator func over every individual response text
-            evals = [eval_func(
+            # Run process func over every individual response text
+            proc = [process_func(
                         ResponseInfo(
                             text=r,
                             prompt=resp_obj['prompt'],
@@ -174,52 +172,79 @@ def run_over_responses(eval_func, responses: list, scope: str) -> list:
                             llm=resp_obj['llm'])
                     ) for r in res]
 
-            # Check the type of evaluation results
-            # NOTE: We assume this is consistent across all evaluations, but it may not be.
-            eval_res_type = check_typeof_vals(evals)
+            if process_type == 'processor':
+                # Response text was just transformed, not evaluated
+                resp_obj['responses'] = proc
+            else: 
+                # Responses were evaluated/scored
+                # Check the type of evaluation results
+                # NOTE: We assume this is consistent across all evaluations, but it may not be.
+                eval_res_type = check_typeof_vals(proc)
 
-            if eval_res_type == MetricType.Numeric:
-                # Store items with summary of mean, median, etc
-                resp_obj['eval_res'] = {
-                    'mean': mean(evals),
-                    'median': median(evals),
-                    'stdev': stdev(evals) if len(evals) > 1 else 0,
-                    'range': (min(evals), max(evals)),
-                    'items': evals,
-                    'dtype': eval_res_type.name,
-                }
-            elif eval_res_type in (MetricType.Unknown, MetricType.Empty):
-                raise Exception('Unsupported types found in evaluation results. Only supported types for metrics are: int, float, bool, str.')
-            else:
-                # Categorical, KeyValue, etc, we just store the items:
-                resp_obj['eval_res'] = { 
-                    'items': evals,
-                    'dtype': eval_res_type.name,
-                }
+                if eval_res_type == MetricType.Numeric:
+                    # Store items with summary of mean, median, etc
+                    resp_obj['eval_res'] = {
+                        'mean': mean(proc),
+                        'median': median(proc),
+                        'stdev': stdev(proc) if len(proc) > 1 else 0,
+                        'range': (min(proc), max(proc)),
+                        'items': proc,
+                        'dtype': eval_res_type.name,
+                    }
+                elif eval_res_type in (MetricType.Unknown, MetricType.Empty):
+                    raise Exception('Unsupported types found in evaluation results. Only supported types for metrics are: int, float, bool, str.')
+                else:
+                    # Categorical, KeyValue, etc, we just store the items:
+                    resp_obj['eval_res'] = { 
+                        'items': proc,
+                        'dtype': eval_res_type.name,
+                    }
         else:  
-            # Run evaluator func over the entire response batch
-            ev = eval_func([
+            # Run process func over the entire response batch
+            proc = process_func([
                     ResponseInfo(text=r,
                                  prompt=resp_obj['prompt'],
                                  var=resp_obj['vars'],
                                  llm=resp_obj['llm'])
-                for r in res])
-            ev_type = check_typeof_vals([ev])
-            if ev_type == MetricType.Numeric:
-                resp_obj['eval_res'] = {
-                    'mean': ev,
-                    'median': ev,
-                    'stdev': 0,
-                    'range': (ev, ev),
-                    'items': [ev],
-                    'type': ev_type.name,
-                }
-            else:
-                resp_obj['eval_res'] = { 
-                    'items': [ev],
-                    'type': ev_type.name,
-                }
+                   for r in res])
+            
+            if process_type == 'processor':
+                # Response text was just transformed, not evaluated
+                resp_obj['responses'] = proc
+            else: 
+                # Responses were evaluated/scored
+                ev_type = check_typeof_vals([proc])
+                if ev_type == MetricType.Numeric:
+                    resp_obj['eval_res'] = {
+                        'mean': proc,
+                        'median': proc,
+                        'stdev': 0,
+                        'range': (proc, proc),
+                        'items': [proc],
+                        'type': ev_type.name,
+                    }
+                else:
+                    resp_obj['eval_res'] = { 
+                        'items': [proc],
+                        'type': ev_type.name,
+                    }
     return responses
+
+async def make_sync_call_async(sync_method, *args, **params):
+    """
+        Makes a blocking synchronous call asynchronous, so that it can be awaited.
+        NOTE: This is necessary for LLM APIs that do not yet support async (e.g. Google PaLM).
+    """
+    loop = asyncio.get_running_loop()
+    method = sync_method
+    if len(params) > 0:
+        def partial_sync_meth(*a):
+            return sync_method(*a, **params)
+        method = partial_sync_meth
+    return await loop.run_in_executor(None, method, *args)
+
+def exclude_key(d, key_to_exclude):
+        return {k: v for k, v in d.items() if k != key_to_exclude}
 
 
 """ ===================
@@ -252,6 +277,7 @@ def executepy():
             'responses': List[StandardizedLLMResponse]  # the responses to run on.
             'scope': 'response' | 'batch'  # the scope of responses to run on --a single response, or all across each batch. 
                                            # If batch, evaluator has access to 'responses'. Only matters if n > 1 for each prompt.
+            'process_type': 'evaluator' | 'processor'  # the type of processing to perform. Evaluators only 'score'/annotate responses. Processors change responses (e.g. text).
             'script_paths': unspecified | List[str]  # the paths to scripts to be added to the path before the lambda function is evaluated
         }
 
@@ -273,7 +299,7 @@ def executepy():
     if (isinstance(responses, str) or not isinstance(responses, list)) or (len(responses) > 0 and any([not isinstance(r, dict) for r in responses])):
         return jsonify({'error': 'POST data responses is improper format.'})
 
-    # add the path to any scripts to the path:
+    # Add the path to any scripts to the path:
     try:
         if 'script_paths' in data:
             for script_path in data['script_paths']:
@@ -290,6 +316,9 @@ def executepy():
     except Exception as e:
         return jsonify({'error': f'Could not add script path to sys.path. Error message:\n{str(e)}'})
 
+    # Get processor type, if any
+    process_type = data['process_type'] if 'process_type' in data else 'evaluator'
+
     # Create the evaluator function
     # DANGER DANGER! 
     try:
@@ -297,7 +326,10 @@ def executepy():
 
         # Double-check that there is an 'evaluate' method in our namespace. 
         # This will throw a NameError if not: 
-        evaluate  # noqa
+        if process_type == 'evaluator':
+            evaluate  # noqa
+        else:
+            process  # noqa
     except Exception as e:
         return jsonify({'error': f'Could not compile evaluator code. Error message:\n{str(e)}'})
     
@@ -305,7 +337,7 @@ def executepy():
     logs = []
     try:
         HIJACK_PYTHON_PRINT()
-        evald_responses = run_over_responses(evaluate, responses, scope=data['scope'])  # noqa
+        evald_responses = run_over_responses(evaluate if process_type == 'evaluator' else process, responses, scope=data['scope'], process_type=process_type)  # noqa
         logs = REVERT_PYTHON_PRINT()
     except Exception as e:
         logs = REVERT_PYTHON_PRINT()
@@ -367,7 +399,7 @@ def fetchOpenAIEval():
 
         POST'd data should be in form:
         { 
-            name: <str>  # The name of the eval to grab (without .cforge extension)
+            'name': <str>  # The name of the eval to grab (without .cforge extension)
         }
     """
     # Verify post'd data
@@ -404,9 +436,8 @@ def fetchOpenAIEval():
             return jsonify({'error': f"Error creating a new directory 'oaievals' at filepath {oaievals_cache_dir}: {str(e)}"})
 
     # Download the preconverted OpenAI eval from the GitHub main branch for ChainForge
-    import requests
     _url = f"https://raw.githubusercontent.com/ianarawjo/ChainForge/main/chainforge/oaievals/{evalname}.cforge"
-    response = requests.get(_url)
+    response = py_requests.get(_url)
 
     # Check if the request was successful (status code 200)
     if response.status_code == 200:
@@ -433,7 +464,8 @@ def fetchEnvironAPIKeys():
         'PALM_API_KEY': 'Google', 
         'HUGGINGFACE_API_KEY': 'HuggingFace',
         'AZURE_OPENAI_KEY': 'Azure_OpenAI', 
-        'AZURE_OPENAI_ENDPOINT': 'Azure_OpenAI_Endpoint'
+        'AZURE_OPENAI_ENDPOINT': 'Azure_OpenAI_Endpoint',
+        'ALEPH_ALPHA_API_KEY': 'AlephAlpha'
     }
     d = { alias: os.environ.get(key) for key, alias in keymap.items() }
     ret = jsonify(d)
@@ -449,9 +481,9 @@ def makeFetchCall():
 
         POST'd data should be in form:
         {
-            url: <str>  # the url to fetch from
-            headers: <dict>  # a JSON object of the headers
-            body: <dict>  # the request payload, as JSON
+            'url': <str>  # the url to fetch from
+            'headers': <dict>  # a JSON object of the headers
+            'body': <dict>  # the request payload, as JSON
         }
     """
     # Verify post'd data
@@ -486,8 +518,6 @@ async def callDalai():
     if not set(data.keys()).issuperset({'prompt', 'model', 'server', 'n', 'temperature'}):
         return jsonify({'error': 'POST data is improper format.'})
 
-    data['model'] = LLM_NAME_MAP[data['model']]
-
     try:
         query, response = await call_dalai(**data)
     except Exception as e:
@@ -496,6 +526,189 @@ async def callDalai():
     ret = jsonify({'query': query, 'response': response})
     ret.headers.add('Access-Control-Allow-Origin', '*')
     return ret
+
+
+@app.route('/app/initCustomProvider', methods=['POST'])
+def initCustomProvider():
+    """
+        Initalizes custom model provider(s) defined in a Python script,
+        and returns specs for the front-end UI provider dropdown and the providers' settings window. 
+
+        POST'd data should be in form:
+        {
+            'code': <str>  # the Python script to save + execute,
+        }
+    """
+    # Verify post'd data
+    data = request.get_json()
+    if 'code' not in data:
+        return jsonify({'error': 'POST data is improper format.'})
+
+    # Sanity check that the code actually registers a provider
+    if '@provider' not in data['code']:
+        return jsonify({'error': """Did not detect a @provider decorator. Custom provider scripts should register at least one @provider. 
+                                    Do `from chainforge.providers import provider` and decorate your provider completion function with @provider."""})
+
+    # Establish the custom provider script cache directory
+    provider_scripts_dir = os.path.join(CACHE_DIR, "provider_scripts")
+    if not os.path.isdir(provider_scripts_dir):
+        # Create the directory
+        try:
+            os.mkdir(provider_scripts_dir)
+        except Exception as e:
+            return jsonify({'error': f"Error creating a new directory 'provider_scripts' at filepath {provider_scripts_dir}: {str(e)}"})
+
+    # For keeping track of what script registered providers came from
+    script_id = str(round(time.time()*1000))
+    ProviderRegistry.set_curr_script_id(script_id)
+    ProviderRegistry.watch_next_registered()
+
+    # Attempt to run the Python script, in context
+    try:
+        exec(data['code'], globals(), None)
+
+        # This should have registered one or more new CustomModelProviders.
+    except Exception as e:
+        return jsonify({'error': f'Error while executing custom provider code:\n{str(e)}'})
+
+    # Check whether anything was updated, and what
+    new_registries = ProviderRegistry.last_registered()
+    if len(new_registries) == 0:  # Determine whether there's at least one custom provider.
+        return jsonify({'error': 'Did not detect any custom providers added to the registry. Make sure you are registering your provider with @provider correctly.'})
+
+    # At least one provider was registered; detect if it had a past script id and remove those file(s) from the cache
+    if any((v is not None for v in new_registries.values())):
+        # For every registered provider that was overwritten, remove the cache'd script(s) associated with it:
+        past_script_ids = [v for v in new_registries.values() if v is not None]
+        for sid in past_script_ids:
+            past_script_path = os.path.join(provider_scripts_dir, f"{sid}.py")
+            try:
+                if os.path.isfile(past_script_path):
+                    os.remove(past_script_path)
+            except Exception as e:
+                return jsonify({'error': f"Error removing cache'd custom provider script at filepath {past_script_path}: {str(e)}"})
+
+    # Get the names and specs of all currently registered CustomModelProviders,
+    # and pass that info to the front-end (excluding the func):
+    registered_providers = [exclude_key(d, 'func') for d in ProviderRegistry.get_all()]
+
+    # Copy the passed Python script to a local file in the package directory
+    try:
+        with open(os.path.join(provider_scripts_dir, f"{script_id}.py"), 'w') as f:
+            f.write(data['code'])
+    except Exception as e:
+        return jsonify({'error': f"Error saving script 'provider_scripts' at filepath {provider_scripts_dir}: {str(e)}"})
+
+    # Return all loaded providers
+    return jsonify({'providers': registered_providers})
+
+
+@app.route('/app/loadCachedCustomProviders', methods=['POST'])
+def loadCachedCustomProviders():
+    """
+        Initalizes all custom model provider(s) in the local provider_scripts directory.
+    """
+    provider_scripts_dir = os.path.join(CACHE_DIR, "provider_scripts")
+    if not os.path.isdir(provider_scripts_dir):
+        # No providers to load.
+        return jsonify({'providers': []})
+
+    try:
+        for file_name in os.listdir(provider_scripts_dir):
+            file_path = os.path.join(provider_scripts_dir, file_name)
+            if os.path.isfile(file_path) and os.path.splitext(file_path)[1] == '.py':
+                # For keeping track of what script registered providers came from
+                ProviderRegistry.set_curr_script_id(os.path.splitext(file_name)[0])  
+
+                # Read the Python script
+                with open(file_path, 'r') as f:
+                    code = f.read()
+                
+                # Try to execute it in the global context
+                try:
+                    exec(code, globals(), None)
+                except Exception as code_exc:
+                    # Remove the script file associated w the failed execution
+                    os.remove(file_path)
+                    raise code_exc
+    except Exception as e:
+        return jsonify({'error': f'Error while loading custom providers from cache: \n{str(e)}'})
+
+    # Get the names and specs of all currently registered CustomModelProviders,
+    # and pass that info to the front-end (excluding the func):
+    registered_providers = [exclude_key(d, 'func') for d in ProviderRegistry.get_all()]
+
+    return jsonify({'providers': registered_providers})
+
+
+@app.route('/app/removeCustomProvider', methods=['POST'])
+def removeCustomProvider():
+    """
+        Initalizes custom model provider(s) defined in a Python script,
+        and returns specs for the front-end UI provider dropdown and the providers' settings window. 
+
+        POST'd data should be in form:
+        {
+            'name': <str>  # a name that refers to the registered custom provider in the `ProviderRegistry`
+        }
+    """
+    # Verify post'd data
+    data = request.get_json()
+    name = data.get('name')
+    if name is None:
+        return jsonify({'error': 'POST data is improper format.'})
+    
+    if not ProviderRegistry.has(name):
+        return jsonify({'error': f'Could not find a custom provider named "{name}"'})
+    
+    # Get the script id associated with the provider we're about to remove
+    script_id = ProviderRegistry.get(name).get('script_id')
+
+    # Remove the custom provider from the registry
+    ProviderRegistry.remove(name)
+
+    # Attempt to delete associated script from cache
+    if script_id:
+        script_path = os.path.join(CACHE_DIR, "provider_scripts", f"{script_id}.py")
+        if os.path.isfile(script_path):
+            os.remove(script_path)
+
+    return jsonify({'success': True})
+
+
+@app.route('/app/callCustomProvider', methods=['POST'])
+async def callCustomProvider():
+    """
+        Calls a custom model provider and returns the response.
+
+        POST'd data should be in form:
+        {
+            'name': <str>  # the name of the provider in the `ProviderRegistry`
+            'params': <dict>  # the params (prompt, model, etc) to pass to the provider function.
+        }
+    """
+    # Verify post'd data
+    data = request.get_json()
+    if not set(data.keys()).issuperset({'name', 'params'}):
+        return jsonify({'error': 'POST data is improper format.'})
+    
+    # Load the name of the provider
+    name = data['name']
+    params = data['params']
+
+    # Double-check that the custom provider exists in the registry, and (if passed) a model with that name exists
+    provider_spec = ProviderRegistry.get(name)
+    if provider_spec is None:
+        return jsonify({'error': f'Could not find provider named {name}. Perhaps you need to import a custom provider script?'})
+    
+    # Call + await the custom provider function, passing in the JSON payload as kwargs
+    try:
+        response = await make_sync_call_async(provider_spec.get('func'), **params)
+    except Exception as e:
+        return jsonify({'error': f'Error encountered while calling custom provider function: {str(e)}'})
+
+    # Return the response
+    return jsonify({'response': response})
 
 
 def run_server(host="", port=8000, cmd_args=None):

@@ -3,12 +3,15 @@ import {
   addEdge,
   applyNodeChanges,
   applyEdgeChanges,
-} from 'react-flow-renderer';
+} from 'reactflow';
 import { escapeBraces } from './backend/template';
 import { filterDict } from './backend/utils';
+import { APP_IS_RUNNING_LOCALLY } from './backend/utils';
+import { DuplicateVariableNameError } from './backend/errors';
 
 // Initial project settings
 const initialAPIKeys = {};
+const initialFlags = { "aiSupport": true };
 const initialLLMColors = {};
 
 /** The color palette used for displaying info about different LLMs. */
@@ -25,7 +28,20 @@ export const colorPalettes = {
   var: varColorPalette,
 }
 
-const refreshableOutputNodeTypes = new Set(['evaluator', 'prompt', 'inspect', 'vis', 'llmeval', 'textfields', 'chat']);
+const refreshableOutputNodeTypes = new Set(['evaluator', 'processor', 'prompt', 'inspect', 'vis', 'llmeval', 'textfields', 'chat', 'simpleval', 'join', 'split']);
+
+export let initLLMProviders = [
+  { name: "GPT3.5", emoji: "🤖", model: "gpt-3.5-turbo", base_model: "gpt-3.5-turbo", temp: 1.0 },  // The base_model designates what settings form will be used, and must be unique.
+  { name: "GPT4", emoji: "🥵", model: "gpt-4", base_model: "gpt-4", temp: 1.0 },
+  { name: "Claude", emoji: "📚", model: "claude-2", base_model: "claude-v1", temp: 0.5 },
+  { name: "Gemini", emoji: "♊", model: "gemini-pro", base_model: "palm2-bison", temp: 0.7 },
+  { name: "HuggingFace", emoji: "🤗", model: "tiiuae/falcon-7b-instruct", base_model: "hf", temp: 1.0 },
+  { name: "Aleph Alpha", emoji: "💡", model: "luminous-base", base_model: "luminous-base", temp: 0.0 },
+  { name: "Azure OpenAI", emoji: "🔷", model: "azure-openai", base_model: "azure-openai", temp: 1.0 },
+];
+if (APP_IS_RUNNING_LOCALLY()) {
+  initLLMProviders.push({ name: "Dalai (Alpaca.7B)", emoji: "🦙", model: "alpaca.7B", base_model: "dalai", temp: 0.5 });
+}
 
 // A global store of variables, used for maintaining state
 // across ChainForge and ReactFlow components.
@@ -33,10 +49,30 @@ const useStore = create((set, get) => ({
   nodes: [],
   edges: [],
 
+  // Available LLMs in ChainForge, in the format expected by LLMListItems.
+  AvailableLLMs: [...initLLMProviders],
+  setAvailableLLMs: (llmProviderList) => {
+    set({AvailableLLMs: llmProviderList});
+  },
+
   // Keeping track of LLM API keys
   apiKeys: initialAPIKeys,
   setAPIKeys: (apiKeys) => {
-    set({apiKeys: apiKeys});
+    // Filter out any empty or incorrectly formatted API key values:
+    const new_keys = filterDict(apiKeys, (key) => typeof apiKeys[key] === "string" && apiKeys[key].length > 0);
+    // Only update API keys present in the new array; don't delete existing ones:
+    set({apiKeys: {...get().apiKeys, ...new_keys}});
+  },
+
+  // Flags to toggle on or off features across the application
+  flags: initialFlags,
+  getFlag: (flagName) => {
+    return get().flags[flagName] ?? false;
+  },
+  setFlag: (flagName, flagValue) => {
+    let flags = {...get().flags};
+    flags[flagName] = flagValue;
+    set({flags: flags});
   },
 
   // Keep track of LLM colors, to ensure color consistency across various plots and displays
@@ -140,18 +176,18 @@ const useStore = create((set, get) => ({
               const row_keys = Object.keys(row);
 
               // Check if this is an 'empty' row (with all empty strings); if so, skip it:
-              if (row_keys.every(key => key === '__uid' || !row[key] || row[key].trim() === ""))
+              if (row_keys.every(key => key === '__uid' || !row[key] || (typeof row[key] === "string" && row[key].trim() === "")))
                 return undefined;
 
               const row_excluding_col = {};
               row_keys.forEach(key => {
                 if (key !== src_col.key && key !== '__uid')
-                  row_excluding_col[col_header_lookup[key]] = row[key];
+                  row_excluding_col[col_header_lookup[key]] = row[key].toString();
               });
               return {
                 // We escape any braces in the source text before they're passed downstream.
                 // This is a special property of tabular data nodes: we don't want their text to be treated as prompt templates.
-                text: escapeBraces((src_col.key in row) ? row[src_col.key] : ""),
+                text: escapeBraces((src_col.key in row) ? row[src_col.key].toString() : ""),
                 metavars: row_excluding_col,
                 associate_id: row.__uid, // this is used by the backend to 'carry' certain values together
               }
@@ -184,6 +220,78 @@ const useStore = create((set, get) => ({
       return null;
     }
   },
+
+  // Get the types of nodes attached immediately as input to the given node
+  getImmediateInputNodeTypes: (_targetHandles, node_id) => {
+    const getNode = get().getNode;
+    const edges = get().edges; 
+    let inputNodeTypes = [];
+    edges.forEach(e => {
+      if (e.target == node_id && _targetHandles.includes(e.targetHandle)) {
+        const src_node = getNode(e.source);
+        if (src_node && src_node.type !== undefined)
+          inputNodeTypes.push(src_node.type);
+      }
+    });
+    return inputNodeTypes;
+  },
+
+  // Pull all inputs needed to request responses.
+  // Returns [prompt, vars dict]
+  pullInputData: (_targetHandles, node_id) => {
+    // Functions/data from the store:
+    const getNode = get().getNode;
+    const output = get().output;
+    const edges = get().edges; 
+
+    // Helper function to store collected data in dict: 
+    const store_data = (_texts, _varname, _data) => {
+      if (_varname in _data)
+        _data[_varname] = _data[_varname].concat(_texts);
+      else
+        _data[_varname] = _texts;
+    };
+
+    // Pull data from each source recursively:
+    const pulled_data = {};
+    const get_outputs = (varnames, nodeId, var_history) => {
+      varnames.forEach(varname => {
+        // Check for duplicate variable names
+        if (var_history.has(String(varname).toLowerCase())) 
+          throw new DuplicateVariableNameError(varname);
+        
+        // Add to unique name tally
+        var_history.add(String(varname).toLowerCase());
+        
+        // Find the relevant edge(s):
+        edges.forEach(e => {
+          if (e.target == nodeId && e.targetHandle == varname) {
+            // Get the immediate output:
+            let out = output(e.source, e.sourceHandle);
+            if (!out || !Array.isArray(out) || out.length === 0) return;
+
+            // Check the format of the output. Can be str or dict with 'text' and more attrs:
+            if (typeof out[0] === 'object') {
+              out.forEach(obj => store_data([obj], varname, pulled_data));
+            }
+            else {
+              // Save the list of strings from the pulled output under the var 'varname'
+              store_data(out, varname, pulled_data);
+            }
+            
+            // Get any vars that the output depends on, and recursively collect those outputs as well:
+            const n_vars = getNode(e.source).data.vars;
+            if (n_vars && Array.isArray(n_vars) && n_vars.length > 0)
+              get_outputs(n_vars, e.source, var_history);
+          }
+        });
+      });
+    };
+    get_outputs(_targetHandles, node_id, new Set());
+
+    return pulled_data;
+  },
+
   setDataPropsForNode: (id, data_props) => {
     set({
       nodes: (nds => 
@@ -200,6 +308,12 @@ const useStore = create((set, get) => ({
   },
   getNode: (id) => get().nodes.find(n => n.id === id),
   addNode: (newnode) => {
+    // Make sure we select the added node.
+    // This will float it to the top.
+    get().deselectAllNodes();
+    newnode.selected = true;
+
+    // Add the node to the internal state
     set({
       nodes: get().nodes.concat(newnode)
     });
@@ -209,6 +323,45 @@ const useStore = create((set, get) => ({
       nodes: get().nodes.filter(n => n.id !== id)
     });
   },
+  deselectAllNodes: () => {
+    // Deselect all nodes
+    set({
+      nodes: get().nodes.map((n) => {
+        n.selected = false;
+        return n;
+      })
+    });
+  },
+  bringNodeToFront: (id) => {
+    set({
+      nodes: get().nodes.map((n) => {
+        n.selected = n.id === id;
+        return n;
+      })
+    });
+  },
+  duplicateNode: (id, offset) => {
+    const nodes = get().nodes;
+    const node = nodes.find(n => n.id === id);
+    if (!node) {
+      console.error(`Could not duplicate node: No node found with id ${id}`);
+      return undefined;
+    }
+    // Deep copy node data
+    let dup = JSON.parse(JSON.stringify(node));
+    // Shift position
+    dup.position.x += offset && offset.x !== undefined ? offset.x : 0;
+    dup.position.y += offset && offset.y !== undefined ? offset.y : 0;
+    // Change id to new unique id
+    dup.id = `${dup.type}-${Date.now()}`;
+    // Select it (floats it to top)
+    dup.selected = true;
+    // Deselect all previous nodes
+    get().deselectAllNodes();
+    // Declare new node with copied data, at the shifted position
+    get().addNode(dup);
+    return dup;
+  },
   setNodes: (newnodes) => {
     set({
       nodes: newnodes
@@ -217,6 +370,11 @@ const useStore = create((set, get) => ({
   setEdges: (newedges) => {
     set({
       edges: newedges
+    });
+  },
+  removeEdge: (id) => {
+    set({
+      edges: applyEdgeChanges([{id: id, type: 'remove'}], get().edges),
     });
   },
   onNodesChange: (changes) => {
@@ -234,7 +392,7 @@ const useStore = create((set, get) => ({
     // Get the target node information
     const target = get().getNode(connection.target);
     
-    if (target.type === 'vis' || target.type === 'inspect') {
+    if (target.type === 'vis' || target.type === 'inspect' || target.type === 'simpleval') {
       get().setDataPropsForNode(target.id, { input: connection.source });
     }
 
@@ -243,8 +401,9 @@ const useStore = create((set, get) => ({
       get().setDataPropsForNode(target.id, { refresh: true });
     }
 
-    connection.interactionWidth = 100;
+    connection.interactionWidth = 40;
     connection.markerEnd = {type: 'arrow', width: '22px', height: '22px'};
+    connection.type = 'default';
 
     set({
       edges: addEdge(connection, get().edges) // get().edges.concat(connection)

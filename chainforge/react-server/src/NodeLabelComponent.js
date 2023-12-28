@@ -6,7 +6,9 @@ import StatusIndicator from './StatusIndicatorComponent';
 import AlertModal from './AlertModal';
 import AreYouSureModal from './AreYouSureModal';
 import { useState, useEffect, useCallback} from 'react';
-import { Tooltip } from '@mantine/core';
+import { Tooltip, Popover, Badge, Stack } from '@mantine/core';
+import { IconSparkles } from '@tabler/icons-react';
+
 
 export default function NodeLabel({ title, nodeId, icon, onEdit, onSave, editable, status, alertModal, customButtons, handleRunClick, handleRunHover, runButtonTooltip }) {
     const setDataPropsForNode = useStore((state) => state.setDataPropsForNode);
@@ -90,6 +92,5 @@ export default function NodeLabel({ title, nodeId, icon, onEdit, onSave, editabl
             </div>
             {/* <button className="AmitSahoo45-button-3 nodrag" onClick={handleRunClick}><div className="play-button"></div></button> */}
         </div>
-
     </>);
 }
